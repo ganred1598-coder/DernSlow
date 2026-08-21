@@ -12,7 +12,7 @@
   "d1_databases": [{
     "binding": "DB",
     "database_name": "dernslow-db",
-    "database_id": "31bf0a4a-1c8b-40db-9c12-7bad01297fc5",
+    "database_id": "00000000-0000-0000-0000-000000000000",
     "migrations_dir": "./migrations"
   }],
   "r2_buckets": [{

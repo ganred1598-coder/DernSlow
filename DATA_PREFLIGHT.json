@@ -1,0 +1,14 @@
+{
+  "source": "DERNSLOW OS Google Sheets read-only export",
+  "staging_tables": 19,
+  "included_nonempty_rows": 600,
+  "excluded": ["AdminSessions"],
+  "missing_expected_sheet": ["DailyClosings"],
+  "validation": {
+    "xlsx_read": "passed",
+    "blank_row_filter": "passed",
+    "sql_escape": "passed",
+    "sqlite_d1_compatible_execution": "passed"
+  },
+  "production_tables_modified": false
+}
