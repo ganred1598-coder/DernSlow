@@ -1,0 +1,27 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "dernslow-os",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-21",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*", "/media/*"]
+  },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "dernslow-db",
+    "database_id": "00000000-0000-0000-0000-000000000000",
+    "migrations_dir": "./migrations"
+  }],
+  "r2_buckets": [{
+    "binding": "FILES",
+    "bucket_name": "dernslow-files"
+  }],
+  "durable_objects": {
+    "bindings": [{"name": "RESERVATIONS", "class_name": "ReservationExpiry"}]
+  },
+  "migrations": [{"tag": "v1", "new_sqlite_classes": ["ReservationExpiry"]}],
+  "observability": {"enabled": true, "head_sampling_rate": 1}
+}

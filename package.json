@@ -1,0 +1,19 @@
+{
+  "name": "dernslow-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "types": "wrangler types src/worker-configuration.d.ts",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "deploy:dry": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "latest",
+    "typescript": "latest",
+    "vitest": "latest",
+    "wrangler": "latest"
+  }
+}

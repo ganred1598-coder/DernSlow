@@ -1,0 +1,12 @@
+{
+  "phase": "cloudflare-migration-foundation",
+  "typescript_syntax": "passed_with_node_strip_types",
+  "d1_schema_syntax": "passed_with_sqlite",
+  "wrangler_jsonc_syntax": "passed",
+  "npm_dependencies_installed": false,
+  "wrangler_types": "pending_npm_install",
+  "typescript_typecheck": "pending_npm_install",
+  "wrangler_dry_run": "pending_cloudflare_dependencies",
+  "production_deployed": false,
+  "notes": "npm install could not complete in the restricted workspace; run validation commands in README_TH.md on an internet-connected machine."
+}
