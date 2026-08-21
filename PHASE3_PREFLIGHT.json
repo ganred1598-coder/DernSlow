@@ -1,0 +1,16 @@
+{
+  "phase": 3,
+  "feature": "customer-storefront",
+  "database_id": "31bf0a4a-1c8b-40db-9c12-7bad01297fc5",
+  "checks": {
+    "typescript_syntax": "passed",
+    "typescript_typecheck": "passed",
+    "generated_cloudflare_bindings": "passed",
+    "storefront_javascript_syntax": "passed",
+    "d1_full_sequence_sqlite_simulation": "passed",
+    "source_products_promoted": 40,
+    "source_payment_accounts_promoted": 1,
+    "wrangler_dry_run": "blocked_by_local_windows_sandbox_path_traversal"
+  },
+  "production_deployed": false
+}

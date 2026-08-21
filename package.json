@@ -8,7 +8,10 @@
     "types": "wrangler types src/worker-configuration.d.ts",
     "check": "tsc --noEmit",
     "test": "vitest run",
-    "deploy:dry": "wrangler deploy --dry-run"
+    "deploy:dry": "wrangler deploy --dry-run",
+    "db:migrate": "wrangler d1 migrations apply dernslow-db --remote",
+    "db:import": "wrangler d1 execute dernslow-db --remote --file data/DERNSLOW_OS_staging_import.sql",
+    "db:promote": "wrangler d1 execute dernslow-db --remote --file data/promote_staging_storefront.sql"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "latest",

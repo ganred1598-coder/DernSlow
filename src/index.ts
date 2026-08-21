@@ -1,5 +1,6 @@
 import {ApiError,assertThaiPhone,cleanText} from './domain';
-export {ReservationExpiry} from './reservation-expiry';
+import {ReservationExpiry} from './reservation-expiry';
+export {ReservationExpiry};
 
 type CartItem={product_id:string;quantity:number};
 type CreateOrderBody={request_id:string;customer_key:string;customer_name:string;phone:string;address:string;payment_method:'prepaid'|'cod';payment_account_id?:string;items:CartItem[]};
@@ -25,7 +26,7 @@ async function createOrder(request:Request,env:Env):Promise<Response>{
   if(!address)throw new ApiError(400,'ADDRESS_REQUIRED','กรุณากรอกที่อยู่จัดส่ง');
   if(!Array.isArray(body.items)||body.items.length===0||body.items.length>50)throw new ApiError(400,'INVALID_CART','ตะกร้าว่างหรือมีรายการเกินกำหนด');
 
-  const existing=await env.DB.prepare('SELECT id,order_no,total,reserved_until FROM orders WHERE request_id=?').bind(requestId).first();
+  const existing=await env.DB.prepare('SELECT id AS order_id,order_no,total,reserved_until FROM orders WHERE request_id=?').bind(requestId).first();
   if(existing)return json({ok:true,...existing,idempotent:true});
 
   const quantities=new Map<string,number>();
@@ -37,10 +38,13 @@ async function createOrder(request:Request,env:Env):Promise<Response>{
   }
   const products=[];
   for(const [id,quantity] of quantities){
-    const product=await env.DB.prepare('SELECT id,code,name,price,stock_units,active FROM products WHERE id=?').bind(id).first<{id:string;code:string;name:string;price:number;stock_units:number;active:number}>();
+    const product=await env.DB.prepare(`SELECT id,code,name,stock_units,active,price_1,price_5,price_10,price_30,price_50,price_100,price_500,price_1000
+      FROM products WHERE id=?`).bind(id).first<{id:string;code:string;name:string;stock_units:number;active:number;price_1:number|null;price_5:number|null;price_10:number|null;price_30:number|null;price_50:number|null;price_100:number|null;price_500:number|null;price_1000:number|null}>();
     if(!product||!product.active)throw new ApiError(409,'PRODUCT_UNAVAILABLE','สินค้าไม่พร้อมจำหน่าย');
     if(product.stock_units<quantity)throw new ApiError(409,'INSUFFICIENT_STOCK',product.name+' สต็อกไม่เพียงพอ เหลือ '+product.stock_units);
-    products.push({...product,quantity});
+    const price=product[`price_${quantity}` as keyof typeof product];
+    if(typeof price!=='number'||price<0)throw new ApiError(409,'INVALID_PRODUCT_SIZE',product.name+' ไม่มีราคาสำหรับขนาด '+quantity);
+    products.push({...product,price,quantity});
   }
 
   let paymentAccountId:string|null=null;
@@ -74,7 +78,8 @@ async function createOrder(request:Request,env:Env):Promise<Response>{
     statements.push(env.DB.prepare('INSERT INTO stock_log(id,product_id,order_id,change_units,balance_units,reason,created_at) SELECT ?,?,?,?,stock_units,?,? FROM products WHERE id=?').bind(crypto.randomUUID(),p.id,orderId,-p.quantity,'reservation_created',now.toISOString(),p.id));
   }
   await env.DB.batch(statements);
-  await env.RESERVATIONS.getByName(orderId).schedule(orderId,reservedUntil);
+  const reservation=env.RESERVATIONS.getByName(orderId) as DurableObjectStub<ReservationExpiry>;
+  await reservation.schedule(orderId,reservedUntil);
   return json({ok:true,order_id:orderId,order_no:orderNo,total,reserved_until:reservedUntil,reservation_minutes:minutes},201);
 }
 
@@ -97,9 +102,24 @@ export default {
     const url=new URL(request.url);
     try{
       if(request.method==='GET'&&url.pathname==='/api/health')return json({ok:true,service:'dernslow-os',time:new Date().toISOString()});
+      if(request.method==='GET'&&url.pathname==='/api/config'){
+        const reservationMinutes=Number(await env.DB.prepare("SELECT value FROM settings WHERE key='reservation_minutes'").first<string>('value'))||40;
+        const {results:paymentAccounts}=await env.DB.prepare(`SELECT id,type,provider,account_name,account_number,qr_url
+          FROM payment_accounts WHERE active=1 ORDER BY sort_order,provider`).all();
+        return json({ok:true,reservation_minutes:reservationMinutes,payment_accounts:paymentAccounts});
+      }
       if(request.method==='GET'&&url.pathname==='/api/products'){
-        const {results}=await env.DB.prepare('SELECT id,code,name,category,stock_units,unit_name,price FROM products WHERE active=1 ORDER BY name').all();
+        const {results}=await env.DB.prepare(`SELECT id,code,name,category,description,images_json,category_template,
+          stock_units,unit_name,price_1,price_5,price_10,price_30,price_50,price_100,price_500,price_1000
+          FROM products WHERE active=1 ORDER BY name`).all();
         return json({ok:true,products:results});
+      }
+      if(request.method==='GET'&&url.pathname==='/api/orders'){
+        const customerKey=cleanText(url.searchParams.get('customer_key'),100);
+        if(!/^[A-Za-z0-9_-]{16,100}$/.test(customerKey))throw new ApiError(400,'INVALID_CUSTOMER_KEY','รหัสลูกค้าไม่ถูกต้อง');
+        const {results}=await env.DB.prepare(`SELECT id AS order_id,order_no,total,status,payment_status,payment_method,
+          payment_account_id,reserved_until,created_at,updated_at FROM orders WHERE customer_key=? ORDER BY created_at DESC LIMIT 50`).bind(customerKey).all();
+        return json({ok:true,orders:results});
       }
       if(request.method==='POST'&&url.pathname==='/api/orders')return await createOrder(request,env);
       const slip=url.pathname.match(/^\/api\/orders\/([^/]+)\/slip$/);
