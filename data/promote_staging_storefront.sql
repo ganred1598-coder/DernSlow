@@ -1,5 +1,4 @@
 -- Run only after DERNSLOW_OS_staging_import.sql and migrations 0001/0002.
-BEGIN TRANSACTION;
 
 INSERT INTO settings(key,value,updated_at)
 SELECT key,COALESCE(value,''),COALESCE(updated_at,datetime('now')) FROM staging_settings
@@ -41,5 +40,3 @@ FROM staging_paymentaccounts WHERE COALESCE(id,'')<>''
 ON CONFLICT(id) DO UPDATE SET type=excluded.type,provider=excluded.provider,account_name=excluded.account_name,
   account_number=excluded.account_number,active=excluded.active,sort_order=excluded.sort_order,
   updated_at=excluded.updated_at,qr_url=excluded.qr_url;
-
-COMMIT;

@@ -31,7 +31,6 @@ lines = [
     "-- Generated locally from the read-only DERNSLOW OS Google Sheet export.",
     "-- AdminSessions is deliberately excluded: legacy session tokens must not be migrated.",
     "PRAGMA foreign_keys = OFF;",
-    "BEGIN TRANSACTION;",
     "CREATE TABLE IF NOT EXISTS migration_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
 ]
 summary = []
@@ -60,7 +59,7 @@ metadata = json.dumps(summary, ensure_ascii=False, separators=(",", ":"))
 lines.append("INSERT OR REPLACE INTO migration_metadata(key,value) VALUES ('source','DERNSLOW OS Google Sheets export');")
 lines.append("INSERT OR REPLACE INTO migration_metadata(key,value) VALUES ('generated_at',datetime('now'));")
 lines.append("INSERT OR REPLACE INTO migration_metadata(key,value) VALUES ('summary'," + sql_value(metadata) + ");")
-lines.extend(["COMMIT;", "PRAGMA foreign_keys = ON;"])
+lines.extend(["PRAGMA foreign_keys = ON;"])
 OUTPUT.parent.mkdir(parents=True, exist_ok=True)
 OUTPUT.write_text("\n".join(lines) + "\n", encoding="utf-8")
 validation = sqlite3.connect(":memory:")
