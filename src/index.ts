@@ -97,10 +97,76 @@ async function uploadSlip(request:Request,env:Env,orderId:string):Promise<Respon
   return json({ok:true,order_id:orderId,payment_status:'submitted'});
 }
 
+const ADMIN_EMAIL='ganred1598@gmail.com';
+
+async function requireAdmin(ctx:ExecutionContext):Promise<CloudflareAccessIdentity>{
+  const identity=await ctx.access?.getIdentity();
+  const email=String(identity?.email||'').toLowerCase();
+  if(email!==ADMIN_EMAIL)throw new ApiError(403,'ADMIN_ACCESS_REQUIRED','กรุณาเข้าสู่ระบบด้วยอีเมลแอดมินผ่าน Cloudflare Access');
+  return identity!;
+}
+
+async function adminBootstrap(env:Env,identity:CloudflareAccessIdentity):Promise<Response>{
+  const bangkokDate=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Bangkok',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
+  const todayStart=new Date(bangkokDate+'T00:00:00+07:00').toISOString();
+  const [products,orders,customers,payments,closings,totalProducts,lowStock,totalCustomers,totalOrders,todayOrders,todaySales]=await Promise.all([
+    env.DB.prepare(`SELECT id,code,name,category,description,images_json,stock_units,unit_name,active,price_1,price_5,price_10,price_30,price_50,price_100,price_500,price_1000,updated_at FROM products ORDER BY active DESC,name`).all(),
+    env.DB.prepare(`SELECT o.id,o.order_no,o.customer_name,o.phone,o.address,o.total,o.status,o.payment_status,o.payment_method,o.reserved_until,o.created_at,o.updated_at,COUNT(oi.id) item_lines,COALESCE(SUM(oi.quantity),0) item_units FROM orders o LEFT JOIN order_items oi ON oi.order_id=o.id GROUP BY o.id ORDER BY o.created_at DESC LIMIT 150`).all(),
+    env.DB.prepare(`SELECT id,name,phone,address,points,verified,created_at,updated_at FROM customers ORDER BY updated_at DESC LIMIT 150`).all(),
+    env.DB.prepare(`SELECT id,type,provider,account_name,account_number,active,sort_order FROM payment_accounts ORDER BY active DESC,sort_order,provider`).all(),
+    env.DB.prepare(`SELECT id,closing_date,closed_by,created_at FROM daily_closings ORDER BY closing_date DESC LIMIT 30`).all(),
+    env.DB.prepare('SELECT COUNT(*) value FROM products WHERE active=1').first<{value:number}>(),
+    env.DB.prepare('SELECT COUNT(*) value FROM products WHERE active=1 AND stock_units<=5').first<{value:number}>(),
+    env.DB.prepare('SELECT COUNT(*) value FROM customers').first<{value:number}>(),
+    env.DB.prepare('SELECT COUNT(*) value FROM orders').first<{value:number}>(),
+    env.DB.prepare('SELECT COUNT(*) value FROM orders WHERE created_at>=?').bind(todayStart).first<{value:number}>(),
+    env.DB.prepare("SELECT COALESCE(SUM(total),0) value FROM orders WHERE created_at>=? AND status NOT IN ('cancelled','expired')").bind(todayStart).first<{value:number}>()
+  ]);
+  return json({ok:true,admin:{email:String(identity.email||ADMIN_EMAIL)},summary:{total_products:totalProducts?.value||0,low_stock:lowStock?.value||0,total_customers:totalCustomers?.value||0,total_orders:totalOrders?.value||0,today_orders:todayOrders?.value||0,today_sales:todaySales?.value||0},products:products.results,orders:orders.results,customers:customers.results,payment_accounts:payments.results,daily_closings:closings.results});
+}
+
+async function updateAdminOrder(request:Request,env:Env,orderId:string):Promise<Response>{
+  const body=await readJson<{status?:string;payment_status?:string}>(request);
+  const allowedStatus=['reserved','confirmed','packing','shipped','completed','cancelled','expired'];
+  const allowedPayment=['unpaid','submitted','paid','rejected','cod_pending','cod_paid'];
+  const current=await env.DB.prepare('SELECT id,status,payment_status FROM orders WHERE id=?').bind(orderId).first<{id:string;status:string;payment_status:string}>();
+  if(!current)throw new ApiError(404,'ORDER_NOT_FOUND','ไม่พบออเดอร์');
+  const status=body.status===undefined?current.status:cleanText(body.status,30);
+  const payment=body.payment_status===undefined?current.payment_status:cleanText(body.payment_status,30);
+  if(!allowedStatus.includes(status))throw new ApiError(400,'INVALID_ORDER_STATUS','สถานะออเดอร์ไม่ถูกต้อง');
+  if(!allowedPayment.includes(payment))throw new ApiError(400,'INVALID_PAYMENT_STATUS','สถานะชำระเงินไม่ถูกต้อง');
+  await env.DB.prepare('UPDATE orders SET status=?,payment_status=?,updated_at=? WHERE id=?').bind(status,payment,new Date().toISOString(),orderId).run();
+  return json({ok:true,order_id:orderId,status,payment_status:payment});
+}
+
+async function adjustAdminStock(request:Request,env:Env):Promise<Response>{
+  const body=await readJson<{product_id:string;change:number;reason?:string}>(request);
+  const productId=cleanText(body.product_id,100),change=Number(body.change),reason=cleanText(body.reason||'manual_admin_adjustment',150);
+  if(!productId||!Number.isInteger(change)||change===0)throw new ApiError(400,'INVALID_STOCK_CHANGE','จำนวนปรับสต็อกไม่ถูกต้อง');
+  const product=await env.DB.prepare('SELECT id,name,stock_units FROM products WHERE id=?').bind(productId).first<{id:string;name:string;stock_units:number}>();
+  if(!product)throw new ApiError(404,'PRODUCT_NOT_FOUND','ไม่พบสินค้า');
+  const balance=product.stock_units+change;
+  if(balance<0)throw new ApiError(409,'NEGATIVE_STOCK','สต็อกคงเหลือต้องไม่ติดลบ');
+  const now=new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare('UPDATE products SET stock_units=?,updated_at=? WHERE id=?').bind(balance,now,productId),
+    env.DB.prepare('INSERT INTO stock_log(id,product_id,order_id,change_units,balance_units,reason,created_at) VALUES(?,?,NULL,?,?,?,?)').bind(crypto.randomUUID(),productId,change,balance,reason,now)
+  ]);
+  return json({ok:true,product_id:productId,stock_units:balance});
+}
 export default {
   async fetch(request:Request,env:Env,ctx:ExecutionContext):Promise<Response>{
     const url=new URL(request.url);
     try{
+      if(url.pathname.startsWith('/api/admin/')){
+        const identity=await requireAdmin(ctx);
+        if(request.method==='GET'&&url.pathname==='/api/admin/bootstrap')return await adminBootstrap(env,identity);
+        if(request.method==='POST'&&url.pathname==='/api/admin/pos')return await createOrder(request,env);
+        if(request.method==='POST'&&url.pathname==='/api/admin/stock/adjust')return await adjustAdminStock(request,env);
+        const adminOrder=url.pathname.match(/^\/api\/admin\/orders\/([^/]+)$/);
+        if(request.method==='PATCH'&&adminOrder)return await updateAdminOrder(request,env,decodeURIComponent(adminOrder[1]));
+        throw new ApiError(404,'NOT_FOUND','ไม่พบ Admin API ที่เรียก');
+      }
       if(request.method==='GET'&&url.pathname==='/api/health')return json({ok:true,service:'dernslow-os',time:new Date().toISOString()});
       if(request.method==='GET'&&url.pathname==='/api/config'){
         const lineOaId=await env.DB.prepare("SELECT value FROM settings WHERE key='contact_line_label'").first<string>('value')||'@highdernslow';
