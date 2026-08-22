@@ -97,16 +97,14 @@ async function uploadSlip(request:Request,env:Env,orderId:string):Promise<Respon
   return json({ok:true,order_id:orderId,payment_status:'submitted'});
 }
 
-const ADMIN_EMAIL='ganred1598@gmail.com';
+type AdminSession={id:string;display_name:string;role:string};
+type AdminEnv=Env&{ADMIN_SETUP_CODE:string};
+const adminCookie=(r:Request)=>r.headers.get('cookie')?.match(/(?:^|;\s*)ds_admin_device=([^;]+)/)?.[1]||'';
+async function hashToken(v:string){const d=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(v));return [...new Uint8Array(d)].map(x=>x.toString(16).padStart(2,'0')).join('')}
+async function requireAdmin(request:Request,env:Env):Promise<AdminSession>{const token=adminCookie(request);if(!token)throw new ApiError(401,'ADMIN_DEVICE_REQUIRED','เครื่องนี้ยังไม่ได้รับอนุญาต');const a=await env.DB.prepare('SELECT a.id,a.display_name,a.role FROM admin_devices d JOIN admin_users a ON a.id=d.admin_id WHERE d.token_hash=? AND d.active=1 AND a.active=1').bind(await hashToken(token)).first<AdminSession>();if(!a)throw new ApiError(401,'ADMIN_DEVICE_REQUIRED','สิทธิ์เครื่องนี้หมดอายุหรือถูกยกเลิก');return a}
+async function activateFirstOwner(request:Request,env:AdminEnv){if(await env.DB.prepare("SELECT id FROM admin_users WHERE role='main_owner' AND active=1").first())throw new ApiError(409,'OWNER_EXISTS','ระบบมี Owner หลักแล้ว');const b=await readJson<{code:string;device_name?:string}>(request);if(cleanText(b.code,20)!==env.ADMIN_SETUP_CODE)throw new ApiError(403,'INVALID_SETUP_CODE','รหัสเปิดใช้งานไม่ถูกต้อง');const now=new Date().toISOString(),id=crypto.randomUUID(),token=crypto.randomUUID()+crypto.randomUUID(),hash=await hashToken(token),device=cleanText(b.device_name||'เครื่อง Owner หลัก',80);await env.DB.batch([env.DB.prepare("INSERT INTO admin_users(id,display_name,role,created_at,updated_at) VALUES(?,'Owner หลัก','main_owner',?,?)").bind(id,now,now),env.DB.prepare('INSERT INTO admin_devices(id,admin_id,token_hash,device_name,last_seen_at,created_at) VALUES(?,?,?,?,?,?)').bind(crypto.randomUUID(),id,hash,device,now,now)]);return new Response(JSON.stringify({ok:true}),{headers:{'content-type':'application/json','set-cookie':`ds_admin_device=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=31536000`}})}
 
-async function requireAdmin(ctx:ExecutionContext):Promise<CloudflareAccessIdentity>{
-  const identity=await ctx.access?.getIdentity();
-  const email=String(identity?.email||'').toLowerCase();
-  if(email!==ADMIN_EMAIL)throw new ApiError(403,'ADMIN_ACCESS_REQUIRED','กรุณาเข้าสู่ระบบด้วยอีเมลแอดมินผ่าน Cloudflare Access');
-  return identity!;
-}
-
-async function adminBootstrap(env:Env,identity:CloudflareAccessIdentity):Promise<Response>{
+async function adminBootstrap(env:Env,identity:AdminSession):Promise<Response>{
   const bangkokDate=new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Bangkok',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
   const todayStart=new Date(bangkokDate+'T00:00:00+07:00').toISOString();
   const [products,orders,customers,payments,closings,totalProducts,lowStock,totalCustomers,totalOrders,todayOrders,todaySales]=await Promise.all([
@@ -123,7 +121,7 @@ async function adminBootstrap(env:Env,identity:CloudflareAccessIdentity):Promise
     env.DB.prepare("SELECT COALESCE(SUM(total),0) value FROM orders WHERE created_at>=? AND status NOT IN ('cancelled','expired')").bind(todayStart).first<{value:number}>()
   ]);
   const {results:paymentSummary}=await env.DB.prepare(`SELECT payment_status,COUNT(*) orders,COALESCE(SUM(total),0) total FROM orders WHERE status NOT IN ('cancelled','expired') GROUP BY payment_status`).all();
-  return json({ok:true,admin:{email:String(identity.email||ADMIN_EMAIL)},summary:{total_products:totalProducts?.value||0,low_stock:lowStock?.value||0,total_customers:totalCustomers?.value||0,total_orders:totalOrders?.value||0,today_orders:todayOrders?.value||0,today_sales:todaySales?.value||0},payment_summary:paymentSummary,products:products.results,orders:orders.results,customers:customers.results,payment_accounts:payments.results,daily_closings:closings.results});
+  return json({ok:true,admin:{email:identity.display_name,role:identity.role},summary:{total_products:totalProducts?.value||0,low_stock:lowStock?.value||0,total_customers:totalCustomers?.value||0,total_orders:totalOrders?.value||0,today_orders:todayOrders?.value||0,today_sales:todaySales?.value||0},payment_summary:paymentSummary,products:products.results,orders:orders.results,customers:customers.results,payment_accounts:payments.results,daily_closings:closings.results});
 }
 
 async function updateAdminOrder(request:Request,env:Env,orderId:string):Promise<Response>{
@@ -159,8 +157,9 @@ export default {
   async fetch(request:Request,env:Env,ctx:ExecutionContext):Promise<Response>{
     const url=new URL(request.url);
     try{
+      if(request.method==='POST'&&url.pathname==='/api/admin/device/activate')return await activateFirstOwner(request,env as AdminEnv);
       if(url.pathname.startsWith('/api/admin/')){
-        const identity=await requireAdmin(ctx);
+        const identity=await requireAdmin(request,env);
         if(request.method==='GET'&&url.pathname==='/api/admin/bootstrap')return await adminBootstrap(env,identity);
         if(request.method==='POST'&&url.pathname==='/api/admin/pos')return await createOrder(request,env);
         if(request.method==='POST'&&url.pathname==='/api/admin/stock/adjust')return await adjustAdminStock(request,env);
@@ -190,7 +189,7 @@ export default {
       if(request.method==='POST'&&slip)return await uploadSlip(request,env,decodeURIComponent(slip[1]));
       if(url.pathname.startsWith('/api/'))throw new ApiError(404,'NOT_FOUND','ไม่พบ API ที่เรียก');
       if(request.method==='GET'&&(url.pathname==='/admin'||url.pathname.startsWith('/admin/'))){
-        await requireAdmin(ctx);
+        
         const adminUrl=new URL('/admin/index.html',url);
         return env.ASSETS.fetch(new Request(adminUrl,request));
       }
