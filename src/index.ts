@@ -202,6 +202,10 @@ export default {
       const slip=url.pathname.match(/^\/api\/orders\/([^/]+)\/slip$/);
       if(request.method==='POST'&&slip)return await uploadSlip(request,env,decodeURIComponent(slip[1]));
       if(url.pathname.startsWith('/api/'))throw new ApiError(404,'NOT_FOUND','ไม่พบ API ที่เรียก');
+      if(request.method==='GET'&&url.pathname==='/'){
+        const publicUrl=new URL('/index.html',url);
+        return env.ASSETS.fetch(new Request(publicUrl,request));
+      }
       if(request.method==='GET'&&(url.pathname==='/admin'||url.pathname.startsWith('/admin/'))){
         
         const adminUrl=new URL('/admin/index.html',url);
