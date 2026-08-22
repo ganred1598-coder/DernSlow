@@ -63,7 +63,7 @@ async function createOrder(request:Request,env:Env):Promise<Response>{
   const orderNo='DS'+now.toISOString().replace(/\D/g,'').slice(2,14)+crypto.randomUUID().slice(0,4).toUpperCase();
   const total=products.reduce((sum,p)=>sum+p.price*p.quantity,0);
   const customerStatement=savedCustomer
-    ? env.DB.prepare('UPDATE customers SET name=?,phone=?,address=?,updated_at=? WHERE id=?').bind(name,phone,address,now.toISOString(),customerId)
+    ? env.DB.prepare('UPDATE customers SET name=?,phone=?,address=?,active=1,deleted_at=NULL,updated_at=? WHERE id=?').bind(name,phone,address,now.toISOString(),customerId)
     : env.DB.prepare('INSERT INTO customers(id,customer_key,name,phone,address,created_at,updated_at) VALUES(?,?,?,?,?,?,?)').bind(customerId,customerKey,name,phone,address,now.toISOString(),now.toISOString());
   const statements:D1PreparedStatement[]=[
     customerStatement,
@@ -136,19 +136,43 @@ async function saveAdminSettings(request:Request,env:Env,admin:AdminSession):Pro
   await env.DB.prepare('INSERT INTO admin_audit_log(id,admin_id,admin_name_snapshot,action,entity_type,entity_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?,?)').bind(crypto.randomUUID(),admin.id,admin.display_name,'update_settings','settings','system',JSON.stringify({keys:Object.keys(body.settings||{})}),now).run();
   return json({ok:true,updated:Object.keys(body.settings||{})});
 }
-async function updateAdminOrder(request:Request,env:Env,orderId:string):Promise<Response>{
-  const body=await readJson<{status?:string;payment_status?:string}>(request);
+async function writeAudit(env:Env,admin:AdminSession,action:string,entityType:string,entityId:string,detail:unknown={}){await env.DB.prepare('INSERT INTO admin_audit_log(id,admin_id,admin_name_snapshot,action,entity_type,entity_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?,?)').bind(crypto.randomUUID(),admin.id,admin.display_name,action,entityType,entityId,JSON.stringify(detail),new Date().toISOString()).run()}
+
+async function updateAdminOrder(request:Request,env:Env,admin:AdminSession,orderId:string):Promise<Response>{
+  const body=await readJson<{status?:string;payment_status?:string;customer_name?:string;phone?:string;address?:string}>(request);
   const allowedStatus=['reserved','confirmed','packing','shipped','completed','cancelled','expired'];
   const allowedPayment=['unpaid','submitted','paid','rejected','cod_pending','cod_paid'];
-  const current=await env.DB.prepare('SELECT id,status,payment_status FROM orders WHERE id=?').bind(orderId).first<{id:string;status:string;payment_status:string}>();
+  const current=await env.DB.prepare('SELECT id,status,payment_status,customer_name,phone,address FROM orders WHERE id=?').bind(orderId).first<{id:string;status:string;payment_status:string;customer_name:string;phone:string;address:string}>();
   if(!current)throw new ApiError(404,'ORDER_NOT_FOUND','ไม่พบออเดอร์');
   const status=body.status===undefined?current.status:cleanText(body.status,30);
   const payment=body.payment_status===undefined?current.payment_status:cleanText(body.payment_status,30);
   if(!allowedStatus.includes(status))throw new ApiError(400,'INVALID_ORDER_STATUS','สถานะออเดอร์ไม่ถูกต้อง');
   if(!allowedPayment.includes(payment))throw new ApiError(400,'INVALID_PAYMENT_STATUS','สถานะชำระเงินไม่ถูกต้อง');
-  await env.DB.prepare('UPDATE orders SET status=?,payment_status=?,updated_at=? WHERE id=?').bind(status,payment,new Date().toISOString(),orderId).run();
+  const customerName=body.customer_name===undefined?current.customer_name:cleanText(body.customer_name,150),phone=body.phone===undefined?current.phone:assertThaiPhone(body.phone),address=body.address===undefined?current.address:cleanText(body.address,1000);
+  if(!customerName||!address)throw new ApiError(400,'ORDER_CUSTOMER_REQUIRED','กรุณากรอกชื่อและที่อยู่ให้ครบ');
+  await env.DB.prepare('UPDATE orders SET status=?,payment_status=?,customer_name=?,phone=?,address=?,updated_at=? WHERE id=?').bind(status,payment,customerName,phone,address,new Date().toISOString(),orderId).run();
+  await writeAudit(env,admin,'update_order','order',orderId,{before:current,after:{status,payment_status:payment}});
   return json({ok:true,order_id:orderId,status,payment_status:payment});
 }
+
+async function cancelAdminOrder(request:Request,env:Env,admin:AdminSession,orderId:string):Promise<Response>{
+  const b=await readJson<{reason?:string}>(request),reason=cleanText(b.reason||'ยกเลิกโดยแอดมิน',200);
+  const o=await env.DB.prepare('SELECT id,order_no,status FROM orders WHERE id=?').bind(orderId).first<{id:string;order_no:string;status:string}>();
+  if(!o)throw new ApiError(404,'ORDER_NOT_FOUND','ไม่พบออเดอร์'); if(['cancelled','expired'].includes(o.status))return json({ok:true,status:o.status,idempotent:true});
+  if(['shipped','completed'].includes(o.status))throw new ApiError(409,'ORDER_CANNOT_CANCEL','ออเดอร์ที่ส่งแล้วหรือสำเร็จแล้วไม่สามารถลบได้ กรุณาทำรายการคืนสินค้าแทน');
+  const {results}=await env.DB.prepare('SELECT product_id,quantity FROM order_items WHERE order_id=?').bind(orderId).all<{product_id:string;quantity:number}>(),now=new Date().toISOString(),ss:D1PreparedStatement[]=[];
+  for(const x of results){ss.push(env.DB.prepare('UPDATE products SET stock_units=stock_units+?,updated_at=? WHERE id=?').bind(x.quantity,now,x.product_id));ss.push(env.DB.prepare('INSERT INTO stock_log(id,product_id,order_id,change_units,balance_units,reason,created_at) SELECT ?,?,?,?,stock_units,?,? FROM products WHERE id=?').bind(crypto.randomUUID(),x.product_id,orderId,x.quantity,'order_cancelled: '+reason,now,x.product_id))}
+  ss.push(env.DB.prepare("UPDATE orders SET status='cancelled',updated_at=? WHERE id=?").bind(now,orderId));await env.DB.batch(ss);await (env.RESERVATIONS.getByName(orderId) as DurableObjectStub<ReservationExpiry>).cancel();await writeAudit(env,admin,'cancel_order','order',orderId,{order_no:o.order_no,previous_status:o.status,reason});return json({ok:true,order_id:orderId,status:'cancelled'});
+}
+async function updateAdminProduct(request:Request,env:Env,admin:AdminSession,id:string):Promise<Response>{
+ const b=await readJson<Record<string,unknown>>(request),p=await env.DB.prepare('SELECT * FROM products WHERE id=?').bind(id).first<Record<string,unknown>>();if(!p)throw new ApiError(404,'PRODUCT_NOT_FOUND','ไม่พบสินค้า');const code=cleanText(b.code??p.code,80),name=cleanText(b.name??p.name,150),category=cleanText(b.category??p.category,100),description=cleanText(b.description??p.description,1000),unit=cleanText(b.unit_name??p.unit_name,30),active=b.active===undefined?Number(p.active):Number(Boolean(b.active));if(!code||!name||!unit)throw new ApiError(400,'PRODUCT_REQUIRED','กรุณากรอกรหัส ชื่อ และหน่วยสินค้า');const prices=[1,5,10,30,50,100,500,1000].map(q=>{const v=b['price_'+q]??p['price_'+q];if(v===null||v==='')return null;const n=Number(v);if(!Number.isInteger(n)||n<0)throw new ApiError(400,'INVALID_PRICE','ราคาต้องเป็นจำนวนเต็มตั้งแต่ 0 ขึ้นไป');return n});await env.DB.prepare('UPDATE products SET code=?,name=?,category=?,description=?,unit_name=?,active=?,price_1=?,price_5=?,price_10=?,price_30=?,price_50=?,price_100=?,price_500=?,price_1000=?,updated_at=? WHERE id=?').bind(code,name,category,description,unit,active,...prices,new Date().toISOString(),id).run();await writeAudit(env,admin,'update_product','product',id,{code,name,active});return json({ok:true,product_id:id});
+}
+async function archiveAdminProduct(env:Env,admin:AdminSession,id:string){const p=await env.DB.prepare('SELECT name FROM products WHERE id=?').bind(id).first<{name:string}>();if(!p)throw new ApiError(404,'PRODUCT_NOT_FOUND','ไม่พบสินค้า');await env.DB.prepare("UPDATE products SET active=0,updated_at=datetime('now') WHERE id=?").bind(id).run();await writeAudit(env,admin,'archive_product','product',id,{name:p.name});return json({ok:true,product_id:id})}
+async function updateAdminCustomer(request:Request,env:Env,admin:AdminSession,id:string){const b=await readJson<Record<string,unknown>>(request),c=await env.DB.prepare('SELECT * FROM customers WHERE id=?').bind(id).first<Record<string,unknown>>();if(!c)throw new ApiError(404,'CUSTOMER_NOT_FOUND','ไม่พบลูกค้า');const name=cleanText(b.name??c.name,150),phone=assertThaiPhone(b.phone??c.phone),address=cleanText(b.address??c.address,1000),points=Number(b.points??c.points),verified=b.verified===undefined?Number(c.verified):Number(Boolean(b.verified)),active=b.active===undefined?Number(c.active):Number(Boolean(b.active));if(!name||!Number.isInteger(points)||points<0)throw new ApiError(400,'INVALID_CUSTOMER','ชื่อลูกค้าหรือคะแนนไม่ถูกต้อง');await env.DB.prepare("UPDATE customers SET name=?,phone=?,address=?,points=?,verified=?,active=?,deleted_at=CASE WHEN ?=1 THEN NULL ELSE COALESCE(deleted_at,datetime('now')) END,updated_at=datetime('now') WHERE id=?").bind(name,phone,address,points,verified,active,active,id).run();await writeAudit(env,admin,'update_customer','customer',id,{name,phone,active});return json({ok:true,customer_id:id})}
+async function archiveAdminCustomer(env:Env,admin:AdminSession,id:string){const c=await env.DB.prepare('SELECT name FROM customers WHERE id=?').bind(id).first<{name:string}>();if(!c)throw new ApiError(404,'CUSTOMER_NOT_FOUND','ไม่พบลูกค้า');await env.DB.prepare("UPDATE customers SET active=0,deleted_at=datetime('now'),updated_at=datetime('now') WHERE id=?").bind(id).run();await writeAudit(env,admin,'archive_customer','customer',id,{name:c.name});return json({ok:true,customer_id:id})}
+
+async function saveAdminPaymentAccount(request:Request,env:Env,admin:AdminSession,id:string){const b=await readJson<Record<string,unknown>>(request),fresh=id==='new',a=fresh?null:await env.DB.prepare('SELECT * FROM payment_accounts WHERE id=?').bind(id).first<Record<string,unknown>>();if(!fresh&&!a)throw new ApiError(404,'PAYMENT_ACCOUNT_NOT_FOUND','ไม่พบบัญชีรับเงิน');const type=cleanText(b.type??a?.type??'bank',30),provider=cleanText(b.provider??a?.provider,100),accountName=cleanText(b.account_name??a?.account_name,150),accountNumber=cleanText(b.account_number??a?.account_number,100),active=b.active===undefined?Number(a?.active??1):Number(Boolean(b.active)),sortOrder=Number(b.sort_order??a?.sort_order??0);if(!provider||!accountName||!accountNumber||!Number.isInteger(sortOrder))throw new ApiError(400,'INVALID_PAYMENT_ACCOUNT','กรุณากรอกธนาคาร ชื่อบัญชี และเลขบัญชีให้ครบ');const accountId=fresh?crypto.randomUUID():id,now=new Date().toISOString();if(fresh)await env.DB.prepare('INSERT INTO payment_accounts(id,type,provider,account_name,account_number,active,sort_order,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)').bind(accountId,type,provider,accountName,accountNumber,active,sortOrder,now,now).run();else await env.DB.prepare('UPDATE payment_accounts SET type=?,provider=?,account_name=?,account_number=?,active=?,sort_order=?,updated_at=? WHERE id=?').bind(type,provider,accountName,accountNumber,active,sortOrder,now,accountId).run();await writeAudit(env,admin,fresh?'create_payment_account':'update_payment_account','payment_account',accountId,{provider,account_number:accountNumber,active});return json({ok:true,payment_account_id:accountId})}
+async function archiveAdminPaymentAccount(env:Env,admin:AdminSession,id:string){const a=await env.DB.prepare('SELECT provider FROM payment_accounts WHERE id=?').bind(id).first<{provider:string}>();if(!a)throw new ApiError(404,'PAYMENT_ACCOUNT_NOT_FOUND','ไม่พบบัญชีรับเงิน');await env.DB.prepare("UPDATE payment_accounts SET active=0,updated_at=datetime('now') WHERE id=?").bind(id).run();await writeAudit(env,admin,'archive_payment_account','payment_account',id,{provider:a.provider});return json({ok:true,payment_account_id:id})}
 
 async function adjustAdminStock(request:Request,env:Env):Promise<Response>{
   const body=await readJson<{product_id:string;change:number;reason?:string}>(request);
@@ -177,7 +201,18 @@ export default {
         if(request.method==='POST'&&url.pathname==='/api/admin/pos')return await createOrder(request,env);
         if(request.method==='POST'&&url.pathname==='/api/admin/stock/adjust')return await adjustAdminStock(request,env);
         const adminOrder=url.pathname.match(/^\/api\/admin\/orders\/([^/]+)$/);
-        if(request.method==='PATCH'&&adminOrder)return await updateAdminOrder(request,env,decodeURIComponent(adminOrder[1]));
+        if(request.method==='PATCH'&&adminOrder)return await updateAdminOrder(request,env,identity,decodeURIComponent(adminOrder[1]));
+        if(request.method==='DELETE'&&adminOrder)return await cancelAdminOrder(request,env,identity,decodeURIComponent(adminOrder[1]));
+        const adminProduct=url.pathname.match(/^\/api\/admin\/products\/([^/]+)$/);
+        if(request.method==='PATCH'&&adminProduct)return await updateAdminProduct(request,env,identity,decodeURIComponent(adminProduct[1]));
+        if(request.method==='DELETE'&&adminProduct)return await archiveAdminProduct(env,identity,decodeURIComponent(adminProduct[1]));
+        const adminCustomer=url.pathname.match(/^\/api\/admin\/customers\/([^/]+)$/);
+        if(request.method==='PATCH'&&adminCustomer)return await updateAdminCustomer(request,env,identity,decodeURIComponent(adminCustomer[1]));
+        if(request.method==='DELETE'&&adminCustomer)return await archiveAdminCustomer(env,identity,decodeURIComponent(adminCustomer[1]));
+        if(request.method==='POST'&&url.pathname==='/api/admin/payment-accounts')return await saveAdminPaymentAccount(request,env,identity,'new');
+        const adminPayment=url.pathname.match(/^\/api\/admin\/payment-accounts\/([^/]+)$/);
+        if(request.method==='PATCH'&&adminPayment)return await saveAdminPaymentAccount(request,env,identity,decodeURIComponent(adminPayment[1]));
+        if(request.method==='DELETE'&&adminPayment)return await archiveAdminPaymentAccount(env,identity,decodeURIComponent(adminPayment[1]));
         throw new ApiError(404,'NOT_FOUND','ไม่พบ Admin API ที่เรียก');
       }
       if(request.method==='GET'&&url.pathname==='/api/health')return json({ok:true,service:'dernslow-os',time:new Date().toISOString()});
