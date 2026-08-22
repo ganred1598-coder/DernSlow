@@ -188,7 +188,8 @@ export default {
       const slip=url.pathname.match(/^\/api\/orders\/([^/]+)\/slip$/);
       if(request.method==='POST'&&slip)return await uploadSlip(request,env,decodeURIComponent(slip[1]));
       if(url.pathname.startsWith('/api/'))throw new ApiError(404,'NOT_FOUND','ไม่พบ API ที่เรียก');
-      if(request.method==='GET'&&(url.pathname==='/admin'||url.pathname==='/admin/')){
+      if(request.method==='GET'&&(url.pathname==='/admin'||url.pathname.startsWith('/admin/'))){
+        await requireAdmin(ctx);
         const adminUrl=new URL('/admin/index.html',url);
         return env.ASSETS.fetch(new Request(adminUrl,request));
       }
