@@ -122,7 +122,8 @@ async function adminBootstrap(env:Env,identity:CloudflareAccessIdentity):Promise
     env.DB.prepare('SELECT COUNT(*) value FROM orders WHERE created_at>=?').bind(todayStart).first<{value:number}>(),
     env.DB.prepare("SELECT COALESCE(SUM(total),0) value FROM orders WHERE created_at>=? AND status NOT IN ('cancelled','expired')").bind(todayStart).first<{value:number}>()
   ]);
-  return json({ok:true,admin:{email:String(identity.email||ADMIN_EMAIL)},summary:{total_products:totalProducts?.value||0,low_stock:lowStock?.value||0,total_customers:totalCustomers?.value||0,total_orders:totalOrders?.value||0,today_orders:todayOrders?.value||0,today_sales:todaySales?.value||0},products:products.results,orders:orders.results,customers:customers.results,payment_accounts:payments.results,daily_closings:closings.results});
+  const {results:paymentSummary}=await env.DB.prepare(`SELECT payment_status,COUNT(*) orders,COALESCE(SUM(total),0) total FROM orders WHERE status NOT IN ('cancelled','expired') GROUP BY payment_status`).all();
+  return json({ok:true,admin:{email:String(identity.email||ADMIN_EMAIL)},summary:{total_products:totalProducts?.value||0,low_stock:lowStock?.value||0,total_customers:totalCustomers?.value||0,total_orders:totalOrders?.value||0,today_orders:todayOrders?.value||0,today_sales:todaySales?.value||0},payment_summary:paymentSummary,products:products.results,orders:orders.results,customers:customers.results,payment_accounts:payments.results,daily_closings:closings.results});
 }
 
 async function updateAdminOrder(request:Request,env:Env,orderId:string):Promise<Response>{
