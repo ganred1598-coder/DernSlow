@@ -121,9 +121,21 @@ async function adminBootstrap(env:Env,identity:AdminSession):Promise<Response>{
     env.DB.prepare("SELECT COALESCE(SUM(total),0) value FROM orders WHERE created_at>=? AND status NOT IN ('cancelled','expired')").bind(todayStart).first<{value:number}>()
   ]);
   const {results:paymentSummary}=await env.DB.prepare(`SELECT payment_status,COUNT(*) orders,COALESCE(SUM(total),0) total FROM orders WHERE status NOT IN ('cancelled','expired') GROUP BY payment_status`).all();
-  return json({ok:true,admin:{email:identity.display_name,role:identity.role},summary:{total_products:totalProducts?.value||0,low_stock:lowStock?.value||0,total_customers:totalCustomers?.value||0,total_orders:totalOrders?.value||0,today_orders:todayOrders?.value||0,today_sales:todaySales?.value||0},payment_summary:paymentSummary,products:products.results,orders:orders.results,customers:customers.results,payment_accounts:payments.results,daily_closings:closings.results});
+  const {results:settingRows}=await env.DB.prepare('SELECT key,value FROM settings').all<{key:string;value:string}>();
+  const systemSettings=Object.fromEntries(settingRows.map(x=>[x.key,x.value]));
+  return json({ok:true,admin:{email:identity.display_name,role:identity.role},summary:{total_products:totalProducts?.value||0,low_stock:lowStock?.value||0,total_customers:totalCustomers?.value||0,total_orders:totalOrders?.value||0,today_orders:todayOrders?.value||0,today_sales:todaySales?.value||0},payment_summary:paymentSummary,settings:systemSettings,products:products.results,orders:orders.results,customers:customers.results,payment_accounts:payments.results,daily_closings:closings.results});
 }
 
+async function saveAdminSettings(request:Request,env:Env,admin:AdminSession):Promise<Response>{
+  if(!['main_owner','co_owner'].includes(admin.role))throw new ApiError(403,'OWNER_REQUIRED','เฉพาะ Owner เท่านั้นที่แก้การตั้งค่าระบบได้');
+  const body=await readJson<{settings:Record<string,unknown>}>(request);
+  const allowed:Record<string,{max:number;test?:(v:string)=>boolean}>={store_name:{max:80},brand_primary_color:{max:7,test:v=>/^#[0-9a-fA-F]{6}$/.test(v)},contact_line_label:{max:80},public_heading:{max:120},public_description:{max:500},public_notice:{max:500},reservation_minutes:{max:3,test:v=>/^\d+$/.test(v)&&Number(v)>=5&&Number(v)<=1440},low_stock_threshold:{max:5,test:v=>/^\d+$/.test(v)&&Number(v)>=0},currency_label:{max:10},timezone:{max:40,test:v=>v==='Asia/Bangkok'},carry_forward_enabled:{max:5,test:v=>['true','false'].includes(v)},commission_trigger:{max:20,test:v=>['paid','completed'].includes(v)},dashboard_default_period:{max:20,test:v=>['day','week','month'].includes(v)},pos_default_payment:{max:20,test:v=>['cod','prepaid'].includes(v)}};
+  const now=new Date().toISOString(),statements:D1PreparedStatement[]=[];
+  for(const [key,raw] of Object.entries(body.settings||{})){const rule=allowed[key];if(!rule)throw new ApiError(400,'SETTING_NOT_ALLOWED','ไม่อนุญาตให้แก้การตั้งค่า '+key);const value=cleanText(raw,rule.max);if(rule.test&&!rule.test(value))throw new ApiError(400,'INVALID_SETTING','ค่าของ '+key+' ไม่ถูกต้อง');statements.push(env.DB.prepare('INSERT INTO settings(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at').bind(key,value,now))}
+  if(statements.length)await env.DB.batch(statements);
+  await env.DB.prepare('INSERT INTO admin_audit_log(id,admin_id,admin_name_snapshot,action,entity_type,entity_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?,?)').bind(crypto.randomUUID(),admin.id,admin.display_name,'update_settings','settings','system',JSON.stringify({keys:Object.keys(body.settings||{})}),now).run();
+  return json({ok:true,updated:Object.keys(body.settings||{})});
+}
 async function updateAdminOrder(request:Request,env:Env,orderId:string):Promise<Response>{
   const body=await readJson<{status?:string;payment_status?:string}>(request);
   const allowedStatus=['reserved','confirmed','packing','shipped','completed','cancelled','expired'];
@@ -161,6 +173,7 @@ export default {
       if(url.pathname.startsWith('/api/admin/')){
         const identity=await requireAdmin(request,env);
         if(request.method==='GET'&&url.pathname==='/api/admin/bootstrap')return await adminBootstrap(env,identity);
+        if(request.method==='PUT'&&url.pathname==='/api/admin/settings')return await saveAdminSettings(request,env,identity);
         if(request.method==='POST'&&url.pathname==='/api/admin/pos')return await createOrder(request,env);
         if(request.method==='POST'&&url.pathname==='/api/admin/stock/adjust')return await adjustAdminStock(request,env);
         const adminOrder=url.pathname.match(/^\/api\/admin\/orders\/([^/]+)$/);
@@ -169,8 +182,9 @@ export default {
       }
       if(request.method==='GET'&&url.pathname==='/api/health')return json({ok:true,service:'dernslow-os',time:new Date().toISOString()});
       if(request.method==='GET'&&url.pathname==='/api/config'){
-        const lineOaId=await env.DB.prepare("SELECT value FROM settings WHERE key='contact_line_label'").first<string>('value')||'@highdernslow';
-        return json({ok:true,line_oa_id:lineOaId});
+        const {results}=await env.DB.prepare("SELECT key,value FROM settings WHERE key IN ('contact_line_label','store_name','brand_primary_color','public_heading','public_description','public_notice')").all<{key:string;value:string}>();
+        const config=Object.fromEntries(results.map(x=>[x.key,x.value]));
+        return json({ok:true,line_oa_id:config.contact_line_label||'@highdernslow',config});
       }
       if(request.method==='GET'&&url.pathname==='/api/products'){
         const {results}=await env.DB.prepare(`SELECT id,code,name,category,images_json,category_template,unit_name
