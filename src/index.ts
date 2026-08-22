@@ -104,9 +104,10 @@ export default {
       if(request.method==='GET'&&url.pathname==='/api/health')return json({ok:true,service:'dernslow-os',time:new Date().toISOString()});
       if(request.method==='GET'&&url.pathname==='/api/config'){
         const reservationMinutes=Number(await env.DB.prepare("SELECT value FROM settings WHERE key='reservation_minutes'").first<string>('value'))||40;
+        const lineOaId=await env.DB.prepare("SELECT value FROM settings WHERE key='contact_line_label'").first<string>('value')||'@highdernslow';
         const {results:paymentAccounts}=await env.DB.prepare(`SELECT id,type,provider,account_name,account_number,qr_url
           FROM payment_accounts WHERE active=1 ORDER BY sort_order,provider`).all();
-        return json({ok:true,reservation_minutes:reservationMinutes,payment_accounts:paymentAccounts});
+        return json({ok:true,reservation_minutes:reservationMinutes,payment_accounts:paymentAccounts,line_oa_id:lineOaId});
       }
       if(request.method==='GET'&&url.pathname==='/api/products'){
         const {results}=await env.DB.prepare(`SELECT id,code,name,category,description,images_json,category_template,
@@ -133,3 +134,4 @@ export default {
     }
   }
 } satisfies ExportedHandler<Env>;
+
